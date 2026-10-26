@@ -35,7 +35,7 @@ export type Database = {
         Row: {
           id: string;
           name: string;
-          created_by: string;
+          created_by: string | null;
           created_at: string;
         };
         Insert: never;

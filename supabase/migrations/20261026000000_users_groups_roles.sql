@@ -27,8 +27,9 @@ begin
   insert into public.profiles (id, display_name)
   values (
     new.id,
-    coalesce(nullif(trim(new.raw_user_meta_data ->> 'display_name'), ''),
-             split_part(new.email, '@', 1))
+    left(coalesce(nullif(trim(new.raw_user_meta_data ->> 'display_name'), ''),
+                  nullif(split_part(new.email, '@', 1), ''),
+                  'New user'), 80)
   );
   return new;
 end;
@@ -43,7 +44,7 @@ create trigger on_auth_user_created
 create table public.groups (
   id uuid primary key default gen_random_uuid(),
   name text not null check (char_length(name) between 1 and 80),
-  created_by uuid not null references public.profiles (id),
+  created_by uuid references public.profiles (id) on delete set null,
   created_at timestamptz not null default now()
 );
 
@@ -63,7 +64,7 @@ create table public.group_invites (
   group_id uuid not null references public.groups (id) on delete cascade,
   token text not null unique
     default translate(encode(extensions.gen_random_bytes(18), 'base64'), '+/', '-_'),
-  created_by uuid not null references public.profiles (id),
+  created_by uuid not null references public.profiles (id) on delete cascade,
   expires_at timestamptz not null default now() + interval '7 days',
   revoked_at timestamptz,
   created_at timestamptz not null default now()
@@ -116,7 +117,9 @@ as $$
   );
 $$;
 
--- Keep at least one active admin in every group.
+-- Keep at least one active admin in every group. If the last admin deleted
+-- their account, hand the group to its longest-standing active member, or
+-- delete the group if nobody is left.
 create function public.ensure_group_keeps_admin()
 returns trigger
 language plpgsql
@@ -125,17 +128,35 @@ set search_path = ''
 as $$
 declare
   gid uuid := old.group_id;
+  successor uuid;
 begin
   if not exists (select 1 from public.groups where id = gid) then
     return null; -- group itself is being deleted
   end if;
-  if not exists (
+  if exists (
     select 1 from public.group_members
     where group_id = gid and role = 'admin' and status = 'active'
   ) then
-    raise exception 'A group must keep at least one admin';
+    return null;
   end if;
-  return null;
+
+  if tg_op = 'DELETE'
+     and not exists (select 1 from public.profiles where id = old.user_id) then
+    select user_id into successor
+    from public.group_members
+    where group_id = gid and status = 'active'
+    order by joined_at
+    limit 1;
+    if successor is null then
+      delete from public.groups where id = gid;
+    else
+      update public.group_members set role = 'admin'
+      where group_id = gid and user_id = successor;
+    end if;
+    return null;
+  end if;
+
+  raise exception 'A group must keep at least one admin';
 end;
 $$;
 
